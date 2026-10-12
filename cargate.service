@@ -1,0 +1,19 @@
+[Unit]
+Description=cargate — car alarm daemon (Ubuntu Touch D-Bus sensors)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash -c 'exec python3 -u %h/alarm/bin/cargate.py'
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cargate
+
+[Install]
+WantedBy=default.target

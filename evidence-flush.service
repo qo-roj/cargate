@@ -1,0 +1,6 @@
+[Unit]
+Description=cargate — flush queued evidence when uplink allows
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/alarm/bin/capture_hook.py --flush

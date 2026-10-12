@@ -1,0 +1,10 @@
+[Unit]
+Description=cargate — retry queued evidence every 10 min
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+Unit=evidence-flush.service
+
+[Install]
+WantedBy=timers.target

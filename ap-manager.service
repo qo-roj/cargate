@@ -1,0 +1,7 @@
+[Unit]
+Description=cargate — away/home car AP discriminator
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/alarm/bin/ap_manager.py

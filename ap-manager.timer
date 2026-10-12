@@ -1,0 +1,10 @@
+[Unit]
+Description=cargate — run car AP manager every 5 min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=ap-manager.service
+
+[Install]
+WantedBy=timers.target
