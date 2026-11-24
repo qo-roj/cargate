@@ -14,7 +14,40 @@ import time
 import sys
 from pathlib import Path
 
-BASE_DIR = Path(os.environ.get("CARGATE_ALARM_DIR", Path.home() / "alarm")).expanduser()
+
+def _load_env_file(env_file):
+    """KEY=VALUE lines from the env file; quotes stripped. Missing file = {}."""
+    vals = {}
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+                if m:
+                    vals[m.group(1)] = m.group(2).strip().strip("\"").strip("'")
+    except Exception:
+        pass
+    return vals
+
+
+ENV_FILE = os.path.expanduser(os.environ.get(
+    "CARGATE_ENV_FILE", "~/.config/cargate/env"))
+_FILE_VALS = _load_env_file(ENV_FILE)
+
+
+def _cfg(key, default, expand=False):
+    """Config value: the env FILE wins over the environment variable."""
+    val = _FILE_VALS.get(key)
+    if val is None:
+        val = os.environ.get(key, default)
+    if expand and val:
+        val = os.path.expanduser(val)
+    return val
+
+
+BASE_DIR = Path(_cfg("CARGATE_ALARM_DIR", str(Path.home() / "alarm"), expand=True))
 DB_DIR = BASE_DIR / "db"
 LOG_DIR = BASE_DIR / "log"
 DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -153,16 +186,28 @@ def cell_info():
         return None
 
 
+# ip-api.com's FREE tier is HTTP-only — HTTPS answers 403 "SSL unavailable
+# for this endpoint" (verified live), so the geo feature was dead as shipped.
+IPGEO_URL = 'http://ip-api.com/json/?fields=status,lat,lon,query,country,city'
+IPGEO_TTL_S = 1800  # cache hits AND misses: a doomed call every 60 s on a
+                    # metered SIM burns real data for zero information
+_ipgeo_cache = {"ts": 0.0, "val": None}
+
+
 def ip_geolocation():
-    """Query ip-api.com for coarse lat/lon."""
-    url = 'https://ip-api.com/json/?fields=status,lat,lon,query,country,city'
-    out, err, code = run(f"curl -s --max-time 5 '{url}' 2>/dev/null")
-    if 0 != code:
-        return None
-    try:
-        return json.loads(out)
-    except json.JSONDecodeError:
-        return None
+    """Query ip-api.com for coarse lat/lon (cached; failures included)."""
+    if time.time() - _ipgeo_cache["ts"] < IPGEO_TTL_S:
+        return _ipgeo_cache["val"]
+    out, err, code = run(f"curl -s --max-time 5 '{IPGEO_URL}' 2>/dev/null")
+    val = None
+    if code == 0:
+        try:
+            val = json.loads(out)
+        except json.JSONDecodeError:
+            val = None
+    _ipgeo_cache["ts"] = time.time()
+    _ipgeo_cache["val"] = val
+    return val
 
 
 def location_snapshot():

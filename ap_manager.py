@@ -7,6 +7,7 @@
 """
 import subprocess
 import sys
+from types import SimpleNamespace
 
 HOME_SSID = None  # set via CARGATE_HOME_SSID or the env file
 AP_CONNECTION = None  # NetworkManager connection name of the car AP
@@ -33,14 +34,24 @@ _load_env()
 
 
 def run(cmd, timeout=30):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    """subprocess.run that never raises: a missing/failed/timed-out probe
+    reports returncode -1 so callers can tell ERROR from a clean negative."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return SimpleNamespace(returncode=-1, stdout="", stderr=str(e))
 
 
 def home_client():
-    """True if the alarm phone is currently a client of the home SSID."""
+    """True at home, False away, None when the answer is UNKNOWN:
+    HOME_SSID unset, or the nmcli probe failed/timed out. main() must
+    refuse to touch the AP when this is None — mistaking a failed probe
+    for "away" would raise the car AP at home (the hijack scenario)."""
     if not HOME_SSID:
-        return False
+        return None
     out = run(["nmcli", "-t", "f", "NAME,DEVICE,STATE", "c", "show", "--active"])
+    if out.returncode != 0:
+        return None
     for line in out.stdout.splitlines():
         name = line.split(":")[0]
         if HOME_SSID in name and AP_CONNECTION not in name:
@@ -49,14 +60,28 @@ def home_client():
 
 
 def main():
-    # Only act if the AP connection exists
+    if not HOME_SSID:
+        print("CARGATE_HOME_SSID is not set — cannot tell home from away; "
+              "refusing to manage the car AP. Set it in the env file or environment.")
+        sys.exit(1)
+
+    # Only act if the AP connection exists. A failed probe here is also a
+    # no-action outcome — never act on a check you could not read.
     exists = run(["sudo", "-n", "nmcli", "connection", "show", AP_CONNECTION])
     if exists.returncode != 0:
         print(f"connection {AP_CONNECTION} does not exist yet — nothing to manage")
         sys.exit(0)
 
     home_client_active = home_client()
-    ap_active = run(["nmcli", "-t", "-f", "NAME,DEVICE,STATE", "c", "show", "--active"]).stdout
+    if home_client_active is None:
+        print("cannot determine home/away (nmcli probe failed) — leaving the AP alone")
+        sys.exit(1)
+
+    ap_probe = run(["nmcli", "-t", "-f", "NAME,DEVICE,STATE", "c", "show", "--active"])
+    if ap_probe.returncode != 0:
+        print("cannot read active connections — leaving the AP alone")
+        sys.exit(1)
+    ap_active = ap_probe.stdout
 
     if home_client_active and AP_CONNECTION in ap_active:
         # Should not happen: we're at home and clone-AP is up — bring it down NOW

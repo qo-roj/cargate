@@ -9,6 +9,7 @@ import dbus
 import time
 import math
 import os
+import re
 import signal
 import json
 import sys
@@ -18,20 +19,54 @@ import argparse
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
 
+def _load_env_file(env_file):
+    """KEY=VALUE lines from the env file; quotes stripped. Missing file = {}."""
+    vals = {}
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+                if m:
+                    vals[m.group(1)] = m.group(2).strip().strip("\"").strip("'")
+    except Exception:
+        pass
+    return vals
+
+
+ENV_FILE = os.path.expanduser(os.environ.get(
+    "CARGATE_ENV_FILE", "~/.config/cargate/env"))
+_FILE_VALS = _load_env_file(ENV_FILE)
+
+
+def _cfg(key, default, expand=False):
+    """Config value: the env FILE wins over the environment variable
+    (chargegate parity — the file is the operator's explicit, auditable
+    choice; the process environment is the fallback)."""
+    val = _FILE_VALS.get(key)
+    if val is None:
+        val = os.environ.get(key, default)
+    if expand and val:
+        val = os.path.expanduser(val)
+    return val
+
+
 CONFIG = {
-    "env_file": os.path.expanduser(os.environ.get(
-        "CARGATE_ENV_FILE", "~/.config/cargate/env")),
-    "telegram_chat_id": os.environ.get("CARGATE_CHAT_ID", ""),
-    "device_label": os.environ.get("CARGATE_DEVICE_LABEL", "car"),
-    "alarm_dir": os.path.expanduser(os.environ.get("CARGATE_ALARM_DIR", "~/alarm")),
+    "env_file": ENV_FILE,
+    "telegram_chat_id": _cfg("CARGATE_CHAT_ID", ""),
+    "device_label": _cfg("CARGATE_DEVICE_LABEL", "car"),
+    "alarm_dir": _cfg("CARGATE_ALARM_DIR", "~/alarm", expand=True),
     # evidence-capture hook launched on trigger; resolved next to this file
     # by default. Set CARGATE_CAPTURE_SCRIPT to an absolute path to override.
-    "capture_script": os.path.expanduser(os.environ.get("CARGATE_CAPTURE_SCRIPT", "")),
+    "capture_script": _cfg("CARGATE_CAPTURE_SCRIPT", "", expand=True),
 }
 PID_FILE = Path(CONFIG["alarm_dir"]) / "logs" / "cargate.pid"
 
 def get_telegram_credentials():
-    """Bot token + chat id: env vars first, then the env file."""
+    """Bot token + chat id: the env FILE wins over environment variables
+    (chargegate parity); re-read per call so a broken token can be fixed live."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = CONFIG["telegram_chat_id"]
     try:
@@ -60,12 +95,15 @@ def send_telegram_alert(message):
         }).encode('utf-8')
         req = urllib.request.Request(url, data=data)
         resp = urllib.request.urlopen(req, timeout=5)
-        if resp.status == 200:
+        body = json.loads(resp.read().decode("utf-8", "replace"))
+        if body.get("ok"):
             print("[Alert] Telegram alert sent")
             return True
-        else:
-            print("[Alert] Telegram returned status {}".format(resp.status))
-            return False
+        # Telegram answers 200 with ok:false for some rejections —
+        # counting that as "sent" would arm the cooldown on a lost alert.
+        print("[Alert] Telegram rejected the alert: {}".format(
+            body.get("description") or body))
+        return False
     except Exception as e:
         print("[Alert] Error sending Telegram alert: {}".format(e))
         return False
@@ -89,9 +127,12 @@ class CarAlarmDaemon:
         self._baseline = {}
         self._alert_active = False
         
-        # Alert cooldown: allow re-triggering after this many seconds
+        # Alert cooldown: allow re-triggering after this many seconds.
+        # The cooldown is stamped ONLY on a successful send — a failed
+        # send retries on a growing backoff (silence is the bigger risk).
         self._last_alert_time = 0
         self._alert_cooldown = 180  # seconds between repeated alerts
+        self._alert_fail_streak = 0
 
         # Auto-rebaseline on sustained magnetometer offset (location shift detection)
         self._sustained_offset_start = None
@@ -391,7 +432,11 @@ class CarAlarmDaemon:
         mag_pct = (mag_change / base_mag * 100) if base_mag > 0 else 0
         curr_sign = 1 if curr_mag > base_mag else -1
 
-        if mag_pct > self._mag_threshold:
+        # Same dual gate as the trigger (pct AND absolute): a sub-floor
+        # drift can never alert, so it must never silently re-baseline
+        # either — otherwise a slow magnet could ratchet the baseline
+        # upward without a single alarm ever firing.
+        if mag_pct > self._mag_threshold and mag_change > self._mag_absolute_min:
             if self._sustained_offset_start is None:
                 # Start tracking a potential sustained offset
                 self._sustained_offset_start = time.time()
@@ -425,10 +470,8 @@ class CarAlarmDaemon:
             elapsed = now - self._last_alert_time
             if elapsed < self._alert_cooldown:
                 return
-            self._alert_active = False
         
         self._alert_active = True
-        self._last_alert_time = now
         
         # self._baseline = self._read_all_sensors()  # disabled: keep original baseline
         
@@ -443,7 +486,18 @@ class CarAlarmDaemon:
             alert_msg += location_ctx + "\n"
         alert_msg += "\nTime: {}".format(time.strftime('%Y-%m-%d %H:%M:%S'))
         
-        send_telegram_alert(alert_msg)
+        sent = send_telegram_alert(alert_msg)
+        if sent:
+            self._alert_fail_streak = 0
+            self._last_alert_time = now                  # full cooldown only on success
+        else:
+            # A failed send must not silence the alarm for the full cooldown:
+            # retry on a growing backoff (60s doubling, capped at 600s).
+            self._alert_fail_streak += 1
+            backoff = min(60 * (2 ** (self._alert_fail_streak - 1)), 600)
+            self._last_alert_time = now - self._alert_cooldown + backoff
+            print("[Alert] send failed (streak {}) - retry allowed in ~{}s".format(
+                self._alert_fail_streak, backoff))
 
         # Evidence capture on the peripheral (detached — never blocks the
         # sensor loop). Optional: without a capture hook the alarm still fires.
@@ -452,15 +506,26 @@ class CarAlarmDaemon:
         if not os.path.exists(hook):
             print(f"No capture hook at {hook} — skipping evidence capture")
         else:
+            hook_log = Path(CONFIG["alarm_dir"]) / "logs" / "capture_hook.log"
+            lf = None
+            try:
+                hook_log.parent.mkdir(parents=True, exist_ok=True)
+                lf = open(hook_log, "ab")
+            except Exception:
+                lf = subprocess.DEVNULL
             try:
                 subprocess.Popen(
                     ["python3", hook,
                      "--reason", " ".join(changes)[:80]],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdout=lf, stderr=lf,
                     start_new_session=True)
-                print("Peripheral capture launched (detached)")
+                print("Peripheral capture launched (detached{})".format(
+                    ", log: {}".format(hook_log) if lf is not subprocess.DEVNULL else ""))
             except Exception as e:
                 print(f"Peripheral capture launch failed: {e}")
+            finally:
+                if lf is not subprocess.DEVNULL:
+                    lf.close()
         
         print("\n" + "!"*60)
         print("*** CAR ALARM TRIGGERED ***")
@@ -478,9 +543,13 @@ class CarAlarmDaemon:
         
         if not self.arm():
             print("Failed to arm alarm. Exiting.")
-            return
+            return False
         
         self._activate_sensors()
+        active = [t for t, sid in self._session_ids.items() if sid is not None]
+        if len(active) < 3:
+            print("WARNING: only {} sensor sessions active ({}) - the alarm may be partially blind".format(
+                len(active), ", ".join(active) or "none"))
         
         def signal_handler(sig, frame):
             print('\nShutting down...')
@@ -492,6 +561,8 @@ class CarAlarmDaemon:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
+        blind_streak = 0
+        self._blind_warned = False
         try:
             while True:
                 current = self._read_all_sensors()
@@ -499,10 +570,28 @@ class CarAlarmDaemon:
                 
                 if changed:
                     self.trigger_alert(changes)
-
+                
                 # Auto-rebaseline on sustained magnetometer offset (e.g. car moved to new location)
                 self._check_sustained_offset(current)
-
+                
+                # Blindness watchdog: an armed alarm reading no magnetometer
+                # protects nothing. Warn once via Telegram, keep guarding with
+                # whatever sensors remain, and mark the journal loudly.
+                if current['magnetometer'] is None:
+                    blind_streak += 1
+                    if blind_streak >= 20:
+                        print("ERROR: magnetometer unreadable for ~60s - alarm is blind")
+                        if not self._blind_warned:
+                            self._blind_warned = True
+                            send_telegram_alert("⚠️ {} alarm: magnetometer unreadable - the alarm is BLIND right now".format(
+                                CONFIG["device_label"]))
+                        blind_streak = 0
+                else:
+                    if blind_streak:
+                        print("magnetometer readings recovered")
+                    blind_streak = 0
+                    self._blind_warned = False
+                
                 if int(time.time()) % 10 == 0:
                     mag_val = current['magnetometer'][4] if current['magnetometer'] else 0
                     light_val = current['light'] if current['light'] else 0
@@ -516,10 +605,12 @@ class CarAlarmDaemon:
             print("\nShutting down...")
         except Exception as e:
             print(f"Error in monitor loop: {e}")
+            return False   # non-zero exit -> Restart=on-failure revives the daemon
         finally:
             self.disarm()
             self._deactivate_sensors()
             self._cleanup_pid()
+        return True
 
 
 
@@ -597,6 +688,8 @@ def do_status():
         print(f"Alarm: ARMED and RUNNING (PID {pid})")
     except ProcessLookupError:
         print("Alarm: DISARMED (stale PID file)")
+    except PermissionError:
+        print(f"Alarm: UNKNOWN (PID {pid} is owned by another user)")
 
 
 if __name__ == '__main__':
@@ -619,4 +712,7 @@ if __name__ == '__main__':
         if args.daemon:
             daemonize()
         alarm = CarAlarmDaemon()
-        alarm.run()
+        # Exit code matters: arm failure or a crashed loop must exit
+        # non-zero so cargate.service (Restart=on-failure) revives the
+        # daemon instead of sitting dead with a green exit.
+        sys.exit(0 if alarm.run() else 1)

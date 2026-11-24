@@ -23,28 +23,63 @@ import time
 import urllib.request
 import uuid
 
+
+def _load_env_file(env_file):
+    """KEY=VALUE lines from the env file; quotes stripped. Missing file = {}."""
+    vals = {}
+    try:
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+                if m:
+                    vals[m.group(1)] = m.group(2).strip().strip("\"").strip("'")
+    except Exception:
+        pass
+    return vals
+
+
+ENV_FILE = os.path.expanduser(os.environ.get(
+    "CARGATE_ENV_FILE", "~/.config/cargate/env"))
+_FILE_VALS = _load_env_file(ENV_FILE)
+
+
+def _cfg(key, default, expand=False, cast=str):
+    """Config value: the env FILE wins over the environment variable
+    (chargegate parity). A cast failure falls back to the default."""
+    val = _FILE_VALS.get(key)
+    if val is None:
+        val = os.environ.get(key, default)
+    try:
+        val = cast(val)
+    except (ValueError, TypeError):
+        val = cast(default)
+    if expand and isinstance(val, str) and val:
+        val = os.path.expanduser(val)
+    return val
+
+
 CONFIG = {
-    "env_file": os.path.expanduser(os.environ.get(
-        "CARGATE_ENV_FILE", "~/.config/cargate/env")),
-    "chat_id": os.environ.get("CARGATE_CHAT_ID", ""),
-    "peripheral_user": os.environ.get("CARGATE_PERIPHERAL_USER", ""),
-    "peripheral_port": int(os.environ.get("CARGATE_PERIPHERAL_PORT", "8022")),
-    "ssh_key": os.path.expanduser(os.environ.get(
-        "CARGATE_SSH_KEY", "~/.ssh/id_ed25519")),
-    "leases_file": os.environ.get(
+    "env_file": ENV_FILE,
+    "chat_id": _cfg("CARGATE_CHAT_ID", ""),
+    "peripheral_user": _cfg("CARGATE_PERIPHERAL_USER", ""),
+    "peripheral_port": _cfg("CARGATE_PERIPHERAL_PORT", "8022", cast=int),
+    "ssh_key": _cfg("CARGATE_SSH_KEY", "~/.ssh/id_ed25519", expand=True),
+    "leases_file": _cfg(
         "CARGATE_LEASES_FILE",
         "/var/lib/NetworkManager/dnsmasq-wlan0.leases"),
-    "remote_capture": os.environ.get(
+    "remote_capture": _cfg(
         "CARGATE_REMOTE_CAPTURE", "bash ~/alarm/bin/capture.sh"),
     # hostname prefixes (comma-separated) of household phones that must
     # never be mistaken for the capture peripheral
     "owner_host_prefixes": [
-        p.strip() for p in os.environ.get("CARGATE_OWNER_HOST_PREFIXES", "").split(",")
+        p.strip() for p in _cfg("CARGATE_OWNER_HOST_PREFIXES", "").split(",")
         if p.strip()],
-    "home_ssid": os.environ.get("CARGATE_HOME_SSID", ""),
-    "ap_connection": os.environ.get("CARGATE_AP_CONNECTION", "car-ap"),
-    "capture_root": os.path.expanduser(os.environ.get(
-        "CARGATE_CAPTURE_ROOT", "~/captures")),
+    "home_ssid": _cfg("CARGATE_HOME_SSID", ""),
+    "ap_connection": _cfg("CARGATE_AP_CONNECTION", "car-ap"),
+    "capture_root": _cfg("CARGATE_CAPTURE_ROOT", "~/captures", expand=True),
 }
 PENDING_DIR = os.path.join(CONFIG["capture_root"], "pending")
 TELEGRAM = "https://api.telegram.org/bot{}/{}"
@@ -54,7 +89,8 @@ SUDO = ["sudo", "-n"]
 
 
 def get_token():
-    """Bot token: env var first, then the env file."""
+    """Bot token: the env FILE wins over the environment variable;
+    re-read per call so a token can be fixed live."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     try:
         with open(CONFIG["env_file"]) as f:
@@ -69,7 +105,7 @@ def get_token():
 
 
 def get_chat_id():
-    """Chat id: env var first, then the env file."""
+    """Chat id: the env FILE wins over the environment variable."""
     chat_id = CONFIG["chat_id"]
     try:
         with open(CONFIG["env_file"]) as f:
@@ -87,8 +123,11 @@ def resolve_peripheral_ip():
     """Newest DHCP lease that is not an owner phone."""
     try:
         out = subprocess.run(
+            # leases path rides argv, never interpolated into the code
+            # string — a path containing a quote used to break this silently
             SUDO + ["python3", "-c",
-                    "print(open('%s').read())" % CONFIG["leases_file"]],
+                    "import sys; print(open(sys.argv[1]).read())",
+                    CONFIG["leases_file"]],
             capture_output=True, text=True, timeout=10,
         ).stdout
     except Exception:
@@ -100,7 +139,12 @@ def resolve_peripheral_ip():
             exp, mac, ip, host = parts[0], parts[1], parts[2], parts[3]
             if any(host.startswith(p) for p in CONFIG["owner_host_prefixes"]):
                 continue  # an owner's phone, never the capture peripheral
-            candidates.append((int(exp), ip, host))
+            try:
+                exp = int(exp)
+            except ValueError:
+                print(f"skipping malformed lease line: {line!r}", file=sys.stderr)
+                continue  # malformed/comment line in the leases file
+            candidates.append((exp, ip, host))
     if not candidates:
         return None
     candidates.sort()
@@ -165,6 +209,8 @@ def flush_pending(token):
     os.makedirs(PENDING_DIR, exist_ok=True)
     sent, remaining = 0, 0
     for p in sorted(glob.glob(os.path.join(PENDING_DIR, "*"))):
+        if not os.path.isfile(p):
+            continue  # a stray directory must not crash the whole flush
         base = os.path.basename(p)
         data = open(p, "rb").read()
         if base.endswith((".jpg", ".jpeg")):
@@ -281,6 +327,9 @@ def main():
 
     print(f"pulled {len(pulled)} files to {local_dir}")
     if not pulled:
+        if token:
+            telegram_send("sendMessage", token, chat_id=get_chat_id(),
+                           text=f"⚠️ Alarm trigger ({args.reason}); peripheral capture pulled 0 files - every scp failed. Peripheral at {ip}")
         sys.exit(1)
 
     # Downscale photos for upload

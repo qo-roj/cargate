@@ -32,7 +32,8 @@ a seat, and draws milliwatts.
   oscillating one alerts.
 - **Location context** — on trigger, the alert can embed a WiFi
   fingerprint, cell tower ID, and coarse IP geolocation from
-  `location_tracker.py` (no GPS needed).
+  `location_tracker.py` (no GPS needed; the geo lookup rides plain HTTP
+  because ip-api.com's free tier has no TLS — it's coarse, not secret).
 - **Evidence capture** — on trigger, `capture_hook.py` SSHes into the
   peripheral phone, runs `capture.sh` (photo + 10 s audio), pulls the
   files, downscales with ffmpeg, and delivers them to Telegram.
@@ -107,7 +108,9 @@ out over the alarm phone's LTE.
 `ap_manager.py` runs on a 5-minute timer as the away/home discriminator:
 at home (alarm phone is a client of your home SSID) the car AP comes DOWN —
 broadcasting a clone of your home SSID at home would hijack clients; away,
-it comes UP so the peripheral can join.
+it comes UP so the peripheral can join. It refuses to act at all while
+`CARGATE_HOME_SSID` is unset or its probes fail — a manager that cannot
+tell home from away must never guess.
 
 ## Install
 
@@ -155,9 +158,12 @@ python3 tests/test_cargate.py
 ```
 
 Offline checks, no device needed: config plumbing and env-file parsing, alert
-templating and the cooldown state machine, sustained-offset re-baselining
-(sustained steps re-baseline, oscillation does not), DHCP-lease resolution
-with owner-phone exclusion, and the location tracker's directory layout.
+templating and the cooldown state machine (cooldown stamps only on successful
+sends; failed sends back off and retry), sustained-offset re-baselining
+(sustained steps above BOTH gates re-baseline; oscillation and sub-floor
+drifts do not), DHCP-lease resolution with owner-phone exclusion and
+malformed-line tolerance, ap_manager's refuse-to-act safety, the ip-api
+cache, and the location tracker's directory layout.
 
 ## License
 
